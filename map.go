@@ -3,6 +3,7 @@ package shardmap
 import (
 	"runtime"
 	"sync"
+	"unsafe"
 
 	"github.com/cespare/xxhash"
 	"github.com/tidwall/rhh"
@@ -13,9 +14,18 @@ type Map struct {
 	init   sync.Once
 	cap    int
 	shards int
-	seed   uint32
-	mus    []sync.RWMutex
-	maps   []*rhh.Map
+	mask   uint64
+	s      []paddedShard
+}
+
+type shard struct {
+	sync.RWMutex
+	rhh.Map
+}
+
+type paddedShard struct {
+	shard
+	_ [64-(unsafe.Sizeof(shard{})%64)]byte
 }
 
 // New returns a new hashmap with the specified capacity. This function is only
@@ -29,10 +39,10 @@ func New(cap int) *Map {
 // Returns the previous value, or false when no value was assigned.
 func (m *Map) Set(key string, value interface{}) (prev interface{}, replaced bool) {
 	m.initDo()
-	shard := m.choose(key)
-	m.mus[shard].Lock()
-	prev, replaced = m.maps[shard].Set(key, value)
-	m.mus[shard].Unlock()
+	shard := &m.s[m.choose(key)]
+	shard.Lock()
+	prev, replaced = shard.Set(key, value)
+	shard.Unlock()
 	return prev, replaced
 }
 
@@ -40,10 +50,10 @@ func (m *Map) Set(key string, value interface{}) (prev interface{}, replaced boo
 // Returns false when no value has been assign for key.
 func (m *Map) Get(key string) (value interface{}, ok bool) {
 	m.initDo()
-	shard := m.choose(key)
-	m.mus[shard].RLock()
-	value, ok = m.maps[shard].Get(key)
-	m.mus[shard].RUnlock()
+	shard := &m.s[m.choose(key)]
+	shard.RLock()
+	value, ok = shard.Get(key)
+	shard.RUnlock()
 	return value, ok
 }
 
@@ -51,10 +61,10 @@ func (m *Map) Get(key string) (value interface{}, ok bool) {
 // Returns the deleted value, or false when no value was assigned.
 func (m *Map) Delete(key string) (prev interface{}, deleted bool) {
 	m.initDo()
-	shard := m.choose(key)
-	m.mus[shard].Lock()
-	prev, deleted = m.maps[shard].Delete(key)
-	m.mus[shard].Unlock()
+	shard := &m.s[m.choose(key)]
+	shard.Lock()
+	prev, deleted = shard.Delete(key)
+	shard.Unlock()
 	return prev, deleted
 }
 
@@ -62,24 +72,26 @@ func (m *Map) Delete(key string) (prev interface{}, deleted bool) {
 func (m *Map) Len() int {
 	m.initDo()
 	var len int
-	for i := 0; i < m.shards; i++ {
-		m.mus[i].Lock()
-		len += m.maps[i].Len()
-		m.mus[i].Unlock()
+	for i := range m.s {
+		shard := &m.s[i]
+		shard.Lock()
+		len += shard.Len()
+		shard.Unlock()
 	}
 	return len
 }
 
-// Range iterates overall all key/values.
+// Range iterates over all key/values.
 // It's not safe to call or Set or Delete while ranging.
 func (m *Map) Range(iter func(key string, value interface{}) bool) {
 	m.initDo()
 	var done bool
-	for i := 0; i < m.shards; i++ {
+	for i := range m.s {
 		func() {
-			m.mus[i].RLock()
-			defer m.mus[i].RUnlock()
-			m.maps[i].Range(func(key string, value interface{}) bool {
+			shard := &m.s[i]
+			shard.RLock()
+			defer shard.RUnlock()
+			shard.Range(func(key string, value interface{}) bool {
 				if !iter(key, value) {
 					done = true
 					return false
@@ -94,7 +106,7 @@ func (m *Map) Range(iter func(key string, value interface{}) bool) {
 }
 
 func (m *Map) choose(key string) int {
-	return int(xxhash.Sum64String(key) & uint64(m.shards-1))
+	return int(xxhash.Sum64String(key) & m.mask)
 }
 
 func (m *Map) initDo() {
@@ -103,11 +115,11 @@ func (m *Map) initDo() {
 		for m.shards < runtime.NumCPU()*16 {
 			m.shards *= 2
 		}
-		scap := m.cap / m.shards
-		m.mus = make([]sync.RWMutex, m.shards)
-		m.maps = make([]*rhh.Map, m.shards)
-		for i := 0; i < len(m.maps); i++ {
-			m.maps[i] = rhh.New(scap)
+		m.mask = uint64(m.shards - 1)
+		scap := (m.cap + m.shards - 1) / m.shards
+		m.s = make([]paddedShard, m.shards)
+		for i := 0; i < len(m.s); i++ {
+			m.s[i].Map = *rhh.New(scap)
 		}
 	})
 }
